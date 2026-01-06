@@ -1,0 +1,38 @@
+# Core Dependencies
+numpy
+pandas
+scikit-learn
+scipy
+
+# Deep Learning
+torch
+torchvision
+
+# Visualization
+matplotlib
+seaborn
+plotly
+streamlit
+
+# Explainability
+shap
+
+# Data Processing
+pyarrow
+openpyxl
+
+# Configuration
+pyyaml
+python-dotenv
+
+# Logging & Monitoring
+tqdm
+loguru
+
+# Testing
+pytest
+pytest-cov
+
+# Utilities
+joblib
+click

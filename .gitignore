@@ -1,0 +1,105 @@
+# ===============================
+# Python
+# ===============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ===============================
+# Jupyter / Notebooks
+# ===============================
+.ipynb_checkpoints/
+
+# ===============================
+# Streamlit
+# ===============================
+.streamlit/
+streamlit.log
+
+# ===============================
+# ML Models & Artifacts
+# ===============================
+models/
+checkpoints/
+*.pt
+*.pth
+*.h5
+*.joblib
+*.pkl
+*.onnx
+
+# ===============================
+# Project-Specific Directories (S.A.F.E)
+# ===============================
+data/
+external/
+results/
+scripts/models/
+
+# ===============================
+# Data (DO NOT COMMIT RAW DATA)
+# ===============================
+datasets/
+raw_data/
+processed_data/
+eth_ucy/
+mall_dataset/
+*.csv
+*.tsv
+*.parquet
+
+# ===============================
+# Logs & Outputs
+# ===============================
+logs/
+outputs/
+*.log
+
+# ===============================
+# Experiment Tracking
+# ===============================
+mlruns/
+wandb/
+tensorboard/
+runs/
+
+# ===============================
+# OS Files
+# ===============================
+.DS_Store
+Thumbs.db
+
+# ===============================
+# IDEs & Editors
+# ===============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===============================
+# Secrets & Environment Variables
+# ===============================
+.env
+.env.*
+secrets.yaml
+config/secrets/
+
+# ===============================
+# Temporary & Cache
+# ===============================
+.cache/
+.tmp/
+tmp/
