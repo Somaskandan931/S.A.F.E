@@ -16,24 +16,22 @@ class DatasetManager:
     Loads preprocessed ETH-UCY CSV files and Mall dataset
     """
 
-    def __init__(self, config_path: str = None):
+    def __init__ ( self, config_path: str = None ) :
         """Initialize dataset manager"""
-        from src.config.default_config import DEFAULT_CONFIG
-        self.config = DEFAULT_CONFIG.copy()
+
+        import src.config.default_config as config
+        self.config = config
 
         # Use absolute paths for your datasets
-        self.raw_path = Path(r"C:\Users\somas\PycharmProjects\S.A.F.E\data\raw\eth_ucy")
-        self.mall_path = Path(r"C:\Users\somas\PycharmProjects\S.A.F.E\data\raw\mall_dataset")
-        self.processed_path = Path(self.config['data']['processed_data_path'])
+        self.raw_path = Path( r"C:\Users\somas\PycharmProjects\S.A.F.E\data\raw\eth_ucy" )
+        self.mall_path = Path( r"C:\Users\somas\PycharmProjects\S.A.F.E\data\raw\mall_dataset" )
+        self.processed_path = config.DATA_PATH
 
         # Create directories
-        for path in [self.raw_path, self.processed_path]:
-            path.mkdir(parents=True, exist_ok=True)
+        for path in [self.raw_path, self.processed_path] :
+            path.mkdir( parents=True, exist_ok=True )
 
-        # Cache for loaded datasets
         self.dataset_cache = {}
-
-        # Scan for available files
         self.available_files = self._scan_files()
 
     def _scan_files(self) -> Dict[str, Path]:

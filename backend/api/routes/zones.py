@@ -1,107 +1,85 @@
-"""Zone Management Routes"""
-from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional
+from fastapi import APIRouter, HTTPException
 import pandas as pd
 from pathlib import Path
 
-router = APIRouter( prefix="/api/zones", tags=["zones"] )
+router = APIRouter()
+
+# Path to processed data
+DATA_PATH = Path("data/processed")
 
 
-@router.get( "/list" )
-async def list_zones (
-        file: str = Query( "full_processed_data.csv" )
-) :
-    """List all unique zones in dataset"""
-    try :
-        df = pd.read_csv( Path( "data/processed" ) / file )
+def load_dataset(file_name: str) -> pd.DataFrame:
+    """Safely load dataset CSV"""
+    file_path = DATA_PATH / file_name
 
-        if 'zone_id' not in df.columns :
-            return {"success" : True, "zones" : [], "message" : "No zone_id column found"}
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Dataset '{file_name}' not found"
+        )
 
-        zones = df['zone_id'].unique().tolist()
-        zone_data = []
-
-        for zone in zones :
-            zone_df = df[df['zone_id'] == zone]
-            zone_data.append( {
-                "zone_id" : zone,
-                "count" : len( zone_df ),
-                "avg_footfall" : zone_df['footfall_count'].mean() if 'footfall_count' in df.columns else None,
-                "max_risk" : zone_df['risk_score'].max() if 'risk_score' in df.columns else None
-            } )
-
-        return {"success" : True, "zones" : zone_data, "total" : len( zones )}
-    except Exception as e :
-        raise HTTPException( 500, f"Error listing zones: {str( e )}" )
+    try:
+        return pd.read_csv(file_path)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load dataset: {e}"
+        )
 
 
-@router.get( "/{zone_id}" )
-async def get_zone_data (
-        zone_id: str,
-        file: str = Query( "full_processed_data.csv" ),
-        limit: Optional[int] = None
-) :
-    """Get data for specific zone"""
-    try :
-        df = pd.read_csv( Path( "data/processed" ) / file )
+@router.get("/zones")
+def list_zones(file: str):
+    """
+    List all available zones in a dataset
+    """
+    df = load_dataset(file)
 
-        if 'zone_id' not in df.columns :
-            raise HTTPException( 404, "No zone_id column in dataset" )
+    if "zone_id" not in df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail="zone_id column missing in dataset"
+        )
 
-        zone_df = df[df['zone_id'] == zone_id]
+    zones = sorted(df["zone_id"].unique().tolist())
 
-        if len( zone_df ) == 0 :
-            raise HTTPException( 404, f"Zone {zone_id} not found" )
-
-        if limit :
-            zone_df = zone_df.head( limit )
-
-        return {
-            "success" : True,
-            "zone_id" : zone_id,
-            "data" : zone_df.to_dict( orient="records" ),
-            "count" : len( zone_df )
-        }
-    except HTTPException :
-        raise
-    except Exception as e :
-        raise HTTPException( 500, f"Error fetching zone data: {str( e )}" )
+    return {
+        "file": file,
+        "total_zones": len(zones),
+        "zones": zones
+    }
 
 
-@router.get( "/{zone_id}/stats" )
-async def get_zone_statistics (
-        zone_id: str,
-        file: str = Query( "full_processed_data.csv" )
-) :
-    """Get statistics for specific zone"""
-    try :
-        df = pd.read_csv( Path( "data/processed" ) / file )
-        zone_df = df[df['zone_id'] == zone_id]
+@router.get("/zones/{zone_id}")
+def get_zone_details(zone_id: int, file: str):
+    """
+    Get statistics for a specific zone
+    """
+    df = load_dataset(file)
 
-        if len( zone_df ) == 0 :
-            raise HTTPException( 404, f"Zone {zone_id} not found" )
+    if "zone_id" not in df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail="zone_id column missing in dataset"
+        )
 
-        stats = {
-            "zone_id" : zone_id,
-            "total_records" : len( zone_df ),
-            "time_range" : {
-                "start" : zone_df['timestamp'].min() if 'timestamp' in zone_df else None,
-                "end" : zone_df['timestamp'].max() if 'timestamp' in zone_df else None
-            },
-            "footfall" : {
-                "mean" : zone_df['footfall_count'].mean() if 'footfall_count' in zone_df else None,
-                "max" : zone_df['footfall_count'].max() if 'footfall_count' in zone_df else None,
-                "min" : zone_df['footfall_count'].min() if 'footfall_count' in zone_df else None
-            },
-            "risk" : {
-                "mean" : zone_df['risk_score'].mean() if 'risk_score' in zone_df else None,
-                "max" : zone_df['risk_score'].max() if 'risk_score' in zone_df else None,
-                "high_risk_count" : (zone_df['risk_level'] == 'High').sum() if 'risk_level' in zone_df else None
-            }
-        }
+    # ✅ FIX: zone_id is INTEGER
+    zone_df = df[df["zone_id"] == zone_id]
 
-        return {"success" : True, "statistics" : stats}
-    except HTTPException :
-        raise
-    except Exception as e :
-        raise HTTPException( 500, f"Error calculating statistics: {str( e )}" )
+    if zone_df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No data found for zone_id={zone_id}"
+        )
+
+    summary = {
+        "zone_id": zone_id,
+        "records": len(zone_df),
+        "avg_footfall": float(zone_df["footfall_count"].mean())
+        if "footfall_count" in zone_df.columns else None,
+        "avg_density": float(zone_df["density"].mean())
+        if "density" in zone_df.columns else None,
+        "avg_speed": float(zone_df["velocity_mean"].mean())
+        if "velocity_mean" in zone_df.columns else None
+    }
+
+    return summary

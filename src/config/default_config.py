@@ -194,6 +194,18 @@ MODEL_INFO = {
     }
 }
 
+DEFAULT_CONFIG = {
+    "paths": {
+        "project_root": PROJECT_ROOT,
+        "models": MODELS_PATH,
+        "data": DATA_PATH,
+        "raw": RAW_DATA_PATH
+    },
+    "grid_size": GRID_SIZE,
+    "time_window": TIME_WINDOW,
+    "datasets": DATASETS,
+}
+
 # ============= HELPER FUNCTIONS =============
 
 def get_model_path(model_id: str) -> Path:
