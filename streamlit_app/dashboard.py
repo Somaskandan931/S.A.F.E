@@ -16,6 +16,12 @@ from datetime import datetime
 from collections import deque
 import io
 
+# ========== VIDEO PROCESSING STATES ==========
+NORMAL = "NORMAL"
+CAMERA_SHAKE = "CAMERA_SHAKE"
+END = "END"
+
+
 st.set_page_config(
     page_title="S.A.F.E Dashboard",
     page_icon="🛡️",
@@ -105,66 +111,197 @@ if 'zone_history' not in st.session_state :
 
 
 # ========== VIDEO UTILITIES ==========
-def load_video ( uploaded_video ) :
-    """Load uploaded video file"""
-    tfile = tempfile.NamedTemporaryFile( delete=False, suffix=".mp4" )
-    tfile.write( uploaded_video.read() )
-    tfile.close()
-    return cv2.VideoCapture( tfile.name )
+import cv2
+import numpy as np
+import tempfile
+
+# -----------------------------
+# Video Loading
+# -----------------------------
+def load_video(uploaded_video):
+    temp_file = tempfile.NamedTemporaryFile(delete=False)
+    temp_file.write(uploaded_video.read())
+    temp_file.flush()
+
+    cap = cv2.VideoCapture(temp_file.name)
+
+    if not cap.isOpened():
+        raise RuntimeError("Failed to open video file")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+
+    return cap, total_frames, fps
 
 
-def draw_zone_grid ( frame, rows=2, cols=3 ) :
-    """Draw zone grid overlay on frame"""
+# -----------------------------
+# Zone Grid Functions
+# -----------------------------
+def draw_zone_grid(frame, rows=2, cols=3):
+    """Draw zone grid overlay on a frame."""
+    if frame is None:
+        raise ValueError("Frame is None, cannot draw grid.")
+
     h, w, _ = frame.shape
     zone_id = 1
 
-    for r in range( rows ) :
-        for c in range( cols ) :
-            x1, y1 = int( c * w / cols ), int( r * h / rows )
-            x2, y2 = int( (c + 1) * w / cols ), int( (r + 1) * h / rows )
-
-            cv2.rectangle( frame, (x1, y1), (x2, y2), (0, 255, 0), 2 )
-            cv2.putText( frame, f"Zone {zone_id}",
-                         (x1 + 10, y1 + 30),
-                         cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                         (0, 255, 0), 2 )
+    for r in range(rows):
+        for c in range(cols):
+            x1, y1 = int(c * w / cols), int(r * h / rows)
+            x2, y2 = int((c + 1) * w / cols), int((r + 1) * h / rows)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"Zone {zone_id}", (x1 + 10, y1 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             zone_id += 1
     return frame
 
+def split_into_zones(frame, rows=2, cols=3):
+    """Split frame into spatial zones."""
+    if frame is None:
+        return {}
 
-def split_into_zones ( frame, rows=2, cols=3 ) :
-    """Split frame into spatial zones"""
     h, w, _ = frame.shape
     zones = {}
     zone_id = 1
 
-    for r in range( rows ) :
-        for c in range( cols ) :
-            y1, y2 = int( r * h / rows ), int( (r + 1) * h / rows )
-            x1, x2 = int( c * w / cols ), int( (c + 1) * w / cols )
-            zones[f"Zone {zone_id}"] = frame[y1 :y2, x1 :x2]
+    for r in range(rows):
+        for c in range(cols):
+            y1, y2 = int(r * h / rows), int((r + 1) * h / rows)
+            x1, x2 = int(c * w / cols), int((c + 1) * w / cols)
+            zones[f"Zone {zone_id}"] = frame[y1:y2, x1:x2]
             zone_id += 1
 
     return zones
 
+# -----------------------------
+# Optical Flow & Signals
+# -----------------------------
+def compute_zone_signals(prev_gray, curr_gray, zone_id):
+    """Compute crowd motion signals for a zone using optical flow."""
+    if prev_gray is None or curr_gray is None:
+        return None, None
 
-def compute_zone_signals ( prev_gray, curr_gray, zone_id ) :
-    """Extract motion signals from zone using optical flow"""
     flow = cv2.calcOpticalFlowFarneback(
         prev_gray, curr_gray, None,
-        0.4, 2, 12, 2, 3, 1.1, 0
+        pyr_scale=0.4, levels=2, winsize=12,
+        iterations=2, poly_n=3, poly_sigma=1.1, flags=0
     )
 
-    mag, ang = cv2.cartToPolar( flow[..., 0], flow[..., 1] )
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
 
-    return {
-        "zone_id" : zone_id,
-        "density" : float( np.mean( mag > 1.0 ) * 100 ),
-        "footfall_count" : int( np.sum( mag > 1.0 ) ),
-        "speed_mean" : float( np.mean( mag ) ),
-        "speed_variance" : float( np.var( mag ) ),
-        "direction_variance" : float( np.var( ang ) )
+    signal = {
+        "zone_id": zone_id,
+        "density": float(np.mean(mag) * 100),
+        "speed_mean": float(np.mean(mag)),
+        "speed_variance": float(np.var(mag)),
+        "direction_variance": float(np.var(ang))
     }
+
+    return signal, flow
+
+
+def detect_panic_signature ( signal ) :
+    """Detect panic-like crowd behavior based on density, speed, and directional chaos."""
+    if signal is None :
+        return False
+
+    # More sensitive thresholds
+    high_density = signal["density"] > 50  # Lowered from 70
+    low_speed = signal["speed_mean"] < 2.0  # Increased from 1.5
+    high_chaos = signal["direction_variance"] > 1.5  # Lowered from 2.0
+
+    return high_density and low_speed and high_chaos
+
+# -----------------------------
+# Optical Flow Visualization
+# -----------------------------
+def draw_optical_flow_trails(flow, frame, trail_layer, step=16):
+    """Draw optical flow arrows on frame."""
+    if flow is None or frame is None:
+        return frame, trail_layer
+    h, w = flow.shape[:2]  # 🔥 USE FLOW SIZE, NOT FRAME
+
+    y, x = np.mgrid[
+           step // 2 : h : step,
+           step // 2 : w : step
+           ].reshape( 2, -1 )
+
+    fx, fy = flow[y, x].T
+
+    for (x1, y1, dx, dy) in zip(x, y, fx, fy):
+        x2 = int(x1 + dx)
+        y2 = int(y1 + dy)
+        mag = np.sqrt(dx*dx + dy*dy)
+
+        if mag > 4:
+            color = (0, 0, 255)      # Red = congestion
+            thickness = 2
+        elif mag > 2:
+            color = (0, 255, 255)    # Yellow = slowing
+            thickness = 2
+        elif mag > 1.5:
+            color = (0, 255, 0)      # Green = smooth
+            thickness = 1
+        else:
+            continue  # ignore noise
+
+        cv2.line(trail_layer, (x1, y1), (x2, y2), color, thickness)
+
+    blended = cv2.addWeighted(frame, 0.7, trail_layer, 0.9, 0)
+    return blended, trail_layer
+
+def draw_flow_legend(frame):
+    """Overlay legend for flow visualization."""
+    cv2.rectangle(frame, (10, 10), (260, 120), (0, 0, 0), -1)
+    cv2.rectangle(frame, (10, 10), (260, 120), (255, 255, 255), 1)
+
+    cv2.putText(frame, "Crowd Flow Legend", (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(frame, "Green  : Smooth Flow", (20, 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    cv2.putText(frame, "Yellow : Slowing", (20, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    cv2.putText(frame, "Red    : Congestion", (20, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    return frame
+
+# -----------------------------
+# Example Safe Video Loop
+# -----------------------------
+def process_video(uploaded_video):
+    cap, frame, fps= load_video(uploaded_video)
+    prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    trail_layer = np.zeros_like(frame)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        zones = split_into_zones(frame)
+        flows_for_visualization = []
+
+        for zid, zframe in zones.items():
+            zgray = cv2.cvtColor(zframe, cv2.COLOR_BGR2GRAY)
+            signal, flow = compute_zone_signals(prev_gray, zgray, zid)
+
+            if signal and detect_panic_signature(signal):
+                print(f"Panic detected in {zid}")
+
+            frame, trail_layer = draw_optical_flow_trails(flow, frame, trail_layer)
+
+        frame = draw_zone_grid(frame)
+        frame = draw_flow_legend(frame)
+        prev_gray = gray
+
+        # display or save frame
+        # cv2.imshow("Processed Video", frame)
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     break
+
+    cap.release()
+    # cv2.destroyAllWindows()
 
 
 # ========== API HELPER FUNCTIONS ==========
@@ -199,18 +336,33 @@ def load_model ( model_id ) :
 
 
 def predict_image ( file_bytes, model_id=None ) :
-    """Predict via backend API"""
+    """Predict via backend API with timeout"""
     try :
         files = {"file" : ("frame.jpg", file_bytes, "image/jpeg")}
         params = {"model_id" : model_id} if model_id else {}
-        r = requests.post( f"{API_BASE}/api/predict/image", files=files, params=params, timeout=30 )
+
+        # ✅ ADD TIMEOUT - fail fast if backend is stuck
+        r = requests.post(
+            f"{API_BASE}/api/predict/image",
+            files=files,
+            params=params,
+            timeout=3  # ✅ 3 second timeout instead of 30
+        )
+
         if r.status_code == 200 :
             return r.json()
         else :
-            st.error( f"Prediction error: {r.json().get( 'detail', 'Unknown' )}" )
+            print( f"⚠️ API error: {r.status_code}" )
             return None
+
+    except requests.Timeout :
+        print( "⚠️ API timeout - skipping this frame" )
+        return None
+    except requests.ConnectionError :
+        print( "⚠️ Backend not reachable - skipping prediction" )
+        return None
     except Exception as e :
-        st.error( f"API call failed: {e}" )
+        print( f"⚠️ Prediction failed: {e}" )
         return None
 
 
@@ -223,6 +375,45 @@ def monitor_zone_signal ( signal_data ) :
     if len( st.session_state.zone_history[zone_id]["signals"] ) > 100 :
         st.session_state.zone_history[zone_id]["signals"].pop( 0 )
 
+def detect_camera_shake(prev_gray, curr_gray, threshold=0.25):  # ✅ Changed from 2.0 to 0.25
+    """
+    Detect global camera shake using average optical flow magnitude.
+    Returns:
+        is_shake (bool), global_motion (float)
+    """
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, curr_gray, None,
+        0.5, 3, 15, 3, 5, 1.2, 0
+    )
+
+    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    global_motion = float(np.mean(mag))
+
+    # ✅ DEBUG: Print actual values
+    print(f"🔍 Global motion: {global_motion:.3f}, Threshold: {threshold}, Shake: {global_motion > threshold}")
+
+    is_shake = global_motion > threshold
+    return is_shake, global_motion
+
+def detect_signal_anomaly(signal, history, window=10):
+    if len(history) < window:
+        return False, None
+
+    recent = history[-window:]
+
+    mean_density = np.mean([s["density"] for s in recent])
+    mean_speed = np.mean([s["speed_mean"] for s in recent])
+
+    if signal["density"] > mean_density * 1.8:
+        return True, "DENSITY_SPIKE"
+
+    if signal["speed_mean"] < mean_speed * 0.4:
+        return True, "SPEED_DROP"
+
+    if signal["direction_variance"] > 0.7:
+        return True, "DIRECTION_CHAOS"
+
+    return False, None
 
 # ========== VISUALIZATION FUNCTIONS ==========
 def create_animated_phase_space ( zone_history ) :
@@ -243,7 +434,7 @@ def create_animated_phase_space ( zone_history ) :
     fig = px.scatter(
         df, x="density", y="speed_mean",
         animation_frame="t",
-        size="footfall_count",
+        size="density",
         color="direction_variance",
         hover_data=["zone"],
         range_x=[0, 100], range_y=[0, 10],
@@ -280,6 +471,22 @@ def create_zone_heatmap ( zone_history ) :
     ) )
     fig.update_layout( title="Live Zone Density Heatmap", height=400 )
     return fig
+
+def draw_camera_shake_warning(frame, shake_score):
+    h, w, _ = frame.shape
+
+    cv2.rectangle(frame, (w - 340, 10), (w - 10, 70), (0, 0, 255), -1)
+    cv2.putText(frame, "CAMERA SHAKE DETECTED",
+                (w - 330, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (255, 255, 255), 2)
+
+    cv2.putText(frame, f"Shake Intensity: {shake_score:.2f}",
+                (w - 330, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (255, 255, 255), 1)
+
+    return frame
 
 
 # ========== SIDEBAR ==========
@@ -392,109 +599,159 @@ elif page == "Live Video Monitoring" :
                 st.session_state.monitoring_active = True
 
             if st.session_state.monitoring_active :
-                video_placeholder = st.empty()
-                metrics_placeholder = st.empty()
-                heatmap_placeholder = st.empty()
-                progress_bar = st.progress( 0 )
-                status_text = st.empty()
+                # Create placeholders
+                video_col, metrics_col = st.columns( [3, 1] )
 
-                cap = load_video( uploaded_video )
-                total_frames = int( cap.get( cv2.CAP_PROP_FRAME_COUNT ) )
-                fps = int( cap.get( cv2.CAP_PROP_FPS ) )
+                with video_col :
+                    video_placeholder = st.empty()
 
-                ret, prev_frame = cap.read()
-                prev_frame = cv2.resize( prev_frame, (640, 360) )
-                prev_gray = cv2.cvtColor( prev_frame, cv2.COLOR_BGR2GRAY )
+                with metrics_col :
+                    progress_placeholder = st.empty()
+                    status_placeholder = st.empty()
+                    alert_count_placeholder = st.empty()
 
-                frame_count = 0
+                # Initialize
+                if 'video_cap' not in st.session_state or st.session_state.video_cap is None :
+                    st.session_state.video_cap, st.session_state.total_frames, st.session_state.video_fps = load_video(
+                        uploaded_video )
+                    ret, prev_frame = st.session_state.video_cap.read()
+                    st.session_state.prev_frame = cv2.resize( prev_frame, (640, 360) )
+                    st.session_state.prev_gray = cv2.cvtColor( st.session_state.prev_frame, cv2.COLOR_BGR2GRAY )
+                    st.session_state.trail_layer = np.zeros_like( st.session_state.prev_frame, dtype=np.uint8 )
+                    st.session_state.frame_count = 0
+                    st.session_state.shake_counter = 0
 
-                try :
-                    while cap.isOpened() and st.session_state.monitoring_active :
-                        ret, frame = cap.read()
-                        if not ret :
-                            break
+                # Process frames in a controlled loop
+                import base64
 
-                        frame = cv2.resize( frame, (640, 360) )
-                        frame_count += 1
+                while st.session_state.monitoring_active and st.session_state.video_cap.isOpened() :
+                    ret, frame = st.session_state.video_cap.read()
 
-                        if frame_count % frame_skip != 0 :
-                            continue
+                    if not ret :
+                        status_placeholder.success( "✅ Complete!" )
+                        st.session_state.monitoring_active = False
+                        break
 
-                        gray = cv2.cvtColor( frame, cv2.COLOR_BGR2GRAY )
+                    frame = cv2.resize( frame, (640, 360) )
+                    gray = cv2.cvtColor( frame, cv2.COLOR_BGR2GRAY )
+                    st.session_state.frame_count += 1
+
+                    # Skip frames
+                    if st.session_state.frame_count % frame_skip != 0 :
+                        st.session_state.prev_gray = gray
+                        continue
+
+                    # Check camera shake
+                    # Check camera shake
+                    is_shake, shake_score = detect_camera_shake( st.session_state.prev_gray, gray )
+
+                    if is_shake :
+                        st.session_state.shake_counter += 1
+                        # Generate alert for camera shake
+                        st.session_state.alerts.append( {
+                            "timestamp" : datetime.now(),
+                            "zone" : "GLOBAL",
+                            "risk_level" : "WARNING",
+                            "risk_score" : min( shake_score / 2.0, 1.0 ),
+                            "message" : f"Camera shake detected (intensity: {shake_score:.2f})"
+                        } )
+                    else :
+                        st.session_state.shake_counter = 0
+
+                    if st.session_state.shake_counter < 3 :
+                        # Normal processing
                         zones = split_into_zones( frame )
 
-                        # Process each zone
+                        full_flow = cv2.calcOpticalFlowFarneback(
+                            st.session_state.prev_gray, gray, None,
+                            pyr_scale=0.4, levels=2, winsize=12,
+                            iterations=2, poly_n=3, poly_sigma=1.1, flags=0
+                        )
+
                         for zone_id, zone_frame in zones.items() :
-                            h, w = zone_frame.shape[:2]
-                            zone_prev = prev_gray[:h, :w]
-                            zone_curr = gray[:h, :w]
+                            zone_num = int( zone_id.split()[-1] ) - 1
+                            rows, cols = 2, 3
+                            h, w = frame.shape[:2]
+                            zone_h, zone_w = h // rows, w // cols
+                            row, col = zone_num // cols, zone_num % cols
+                            y1, y2 = row * zone_h, (row + 1) * zone_h
+                            x1, x2 = col * zone_w, (col + 1) * zone_w
 
-                            signal = compute_zone_signals( zone_prev, zone_curr, zone_id )
-                            signal.update( {
-                                "timestamp" : datetime.now().isoformat(),
-                                "entry_count" : np.random.randint( 5, 30 ),
-                                "exit_count" : np.random.randint( 5, 30 )
-                            } )
-                            monitor_zone_signal( signal )
+                            zone_prev = st.session_state.prev_gray[y1 :y2, x1 :x2]
+                            zone_curr = gray[y1 :y2, x1 :x2]
+                            signal, _ = compute_zone_signals( zone_prev, zone_curr, zone_id )
 
-                            # API prediction for high-risk zones
-                            if signal["density"] > 60 :
-                                _, buffer = cv2.imencode( '.jpg', zone_frame )
-                                file_bytes = io.BytesIO( buffer )
-                                result = predict_image( file_bytes, st.session_state.current_model_id )
+                            if signal :
+                                signal.update( {
+                                    "timestamp" : datetime.now().isoformat(),
+                                    "entry_count" : np.random.randint( 5, 30 ),
+                                    "exit_count" : np.random.randint( 5, 30 )
+                                } )
+                                monitor_zone_signal( signal )
 
-                                if result and result["risk_score"] > risk_threshold :
-                                    alert = {
-                                        'timestamp' : datetime.now(),
-                                        'zone' : zone_id,
-                                        'risk_level' : result["risk_level"],
-                                        'risk_score' : result["risk_score"],
-                                        'message' : f"{result['risk_level']} risk in {zone_id}"
-                                    }
-                                    st.session_state.alerts.append( alert )
+                                if detect_panic_signature( signal ) :
+                                    st.session_state.alerts.append( {
+                                        "timestamp" : datetime.now(),
+                                        "zone" : zone_id,
+                                        "risk_level" : "CRITICAL",
+                                        "risk_score" : 0.95,
+                                        "message" : f"Panic signature detected - Density: {signal['density']:.1f}%, Speed: {signal['speed_mean']:.2f}"
+                                    } )
 
-                        # Display annotated frame
-                        frame_overlay = draw_zone_grid( frame.copy() )
-                        video_placeholder.image(
-                            cv2.cvtColor( frame_overlay, cv2.COLOR_BGR2RGB ),
-                            use_container_width=True
-                        )
+                                # Additional anomaly detection
+                                is_anomaly, anomaly_type = detect_signal_anomaly(
+                                    signal,
+                                    st.session_state.zone_history[zone_id]["signals"]
+                                )
 
-                        # Update metrics
-                        with metrics_placeholder.container() :
-                            col1, col2, col3, col4 = st.columns( 4 )
-                            with col1 :
-                                st.metric( "Frame", f"{frame_count}/{total_frames}" )
-                            with col2 :
-                                st.metric( "Active Zones", len( zones ) )
-                            with col3 :
-                                avg_density = np.mean( [
-                                    s["density"] for data in st.session_state.zone_history.values()
-                                    for s in data["signals"][-1 :] if data["signals"]
-                                ] )
-                                st.metric( "Avg Density", f"{avg_density:.1f}%" )
-                            with col4 :
-                                st.metric( "Alerts", len( st.session_state.alerts ) )
+                                if is_anomaly :
+                                    risk_level = "WARNING" if anomaly_type != "DIRECTION_CHAOS" else "CRITICAL"
+                                    st.session_state.alerts.append( {
+                                        "timestamp" : datetime.now(),
+                                        "zone" : zone_id,
+                                        "risk_level" : risk_level,
+                                        "risk_score" : 0.75 if risk_level == "WARNING" else 0.90,
+                                        "message" : f"Anomaly detected: {anomaly_type}"
+                                    } )
 
-                        # Update heatmap
-                        heatmap_placeholder.plotly_chart(
-                            create_zone_heatmap( st.session_state.zone_history ),
-                            use_container_width=True
-                        )
+                        st.session_state.trail_layer = (st.session_state.trail_layer * 0.90).astype( np.uint8 )
+                        frame, st.session_state.trail_layer = draw_optical_flow_trails( full_flow, frame,
+                                                                                        st.session_state.trail_layer )
+                        frame = draw_zone_grid( frame )
+                        frame = draw_flow_legend( frame )
 
-                        prev_gray = gray
-                        progress = frame_count / total_frames
-                        progress_bar.progress( progress )
-                        status_text.text( f"Processing... {progress * 100:.1f}% complete" )
-                        time.sleep( 1 / fps )
+                    st.session_state.prev_gray = gray
 
-                    status_text.success( "✅ Video processing complete!" )
-                    st.session_state.monitoring_active = False
+                    # ✅ Display using base64 HTML (bypasses Streamlit media storage)
+                    _, buffer = cv2.imencode( '.jpg', cv2.cvtColor( frame, cv2.COLOR_BGR2RGB ),
+                                              [cv2.IMWRITE_JPEG_QUALITY, 85] )
+                    img_b64 = base64.b64encode( buffer ).decode()
 
-                except Exception as e :
-                    st.error( f"Error during processing: {e}" )
-                finally :
-                    cap.release()
+                    video_placeholder.markdown(
+                        f'<img src="data:image/jpeg;base64,{img_b64}" width="100%">',
+                        unsafe_allow_html=True
+                    )
+
+                    # Update progress
+                    # Update progress
+                    progress = st.session_state.frame_count / st.session_state.total_frames
+                    progress_placeholder.progress( min( progress, 1.0 ) )
+                    status_placeholder.text( f"Frame {st.session_state.frame_count}/{st.session_state.total_frames}" )
+
+                    # Show alert count
+                    critical_alerts = sum( 1 for a in st.session_state.alerts if a.get( 'risk_level' ) == 'CRITICAL' )
+                    warning_alerts = sum( 1 for a in st.session_state.alerts if a.get( 'risk_level' ) == 'WARNING' )
+                    alert_count_placeholder.markdown( f"""
+                    **Alerts Generated:**  
+                    🔴 Critical: {critical_alerts}  
+                    🟡 Warning: {warning_alerts}
+                    """ )
+                    time.sleep( 1 / st.session_state.video_fps )
+
+                    # Check if stop was pressed
+                    if not st.session_state.monitoring_active :
+                        break
+
 
 elif page == "Signal Analytics" :
     st.title( "📊 Signal Analytics & Insights" )
@@ -549,7 +806,7 @@ elif page == "Signal Analytics" :
             if all_signals :
                 df_sig = pd.DataFrame( all_signals )
                 fig = px.scatter( df_sig, x="speed_mean", y="direction_variance",
-                                  color="zone", size="footfall_count",
+                                  color="zone", size="density",
                                   title="Movement Patterns" )
                 st.plotly_chart( fig, use_container_width=True )
 
@@ -597,7 +854,8 @@ elif page == "Alerts" :
         for idx, alert in enumerate( reversed( list( st.session_state.alerts ) ) ) :
             if alert.get( 'risk_level' ) in filter_level :
                 with st.expander(
-                        f"Alert #{len( st.session_state.alerts ) - idx} - {alert.get( 'zone', 'Unknown' )} - {alert.get( 'risk_level' )} - {alert['timestamp'].strftime( '%H:%M:%S' )}" ) :
+                        f"Alert #{len( st.session_state.alerts ) - idx} - {alert.get( 'zone', 'Unknown' )} - {alert.get( 'risk_level' )} - {alert['timestamp'].strftime( '%H:%M:%S' )}"
+                ) :
                     col1, col2 = st.columns( [2, 1] )
                     with col1 :
                         st.markdown( f"**Time**: {alert['timestamp'].strftime( '%Y-%m-%d %H:%M:%S' )}" )
@@ -623,7 +881,7 @@ elif page == "Alerts" :
                             }
                         ) )
                         fig.update_layout( height=200, margin=dict( l=10, r=10, t=10, b=10 ) )
-                        st.plotly_chart( fig, use_container_width=True )
+                        st.plotly_chart( fig, use_container_width=True, key=f"alert_gauge_{idx}" )
 
         st.markdown( "---" )
         if st.button( "Export Alerts to CSV" ) :
