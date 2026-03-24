@@ -1,0 +1,22 @@
+
+============================================================
+Performance Report: lstm_autoencoder_validation
+============================================================
+
+Classification Metrics:
+  Precision:        0.0160
+  Recall:           0.0156
+  F1 Score:         0.0158
+  Accuracy:         0.9081
+
+Threshold Metrics:
+  ROC AUC:          0.5504
+  Avg Precision:    0.0563
+
+Confusion Matrix:
+  True Positives:   2
+  False Positives:  123
+  True Negatives:   2457
+  False Negatives:  126
+
+============================================================

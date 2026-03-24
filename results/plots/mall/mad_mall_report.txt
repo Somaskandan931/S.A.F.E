@@ -1,0 +1,22 @@
+
+============================================================
+Performance Report: mad_mall
+============================================================
+
+Classification Metrics:
+  Precision:        0.3384
+  Recall:           0.5298
+  F1 Score:         0.4130
+  Accuracy:         0.9250
+
+Threshold Metrics:
+  ROC AUC:          0.8391
+  Avg Precision:    0.3047
+
+Confusion Matrix:
+  True Positives:   89
+  False Positives:  174
+  True Negatives:   3031
+  False Negatives:  79
+
+============================================================

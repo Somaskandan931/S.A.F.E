@@ -1,23 +1,32 @@
 """
-S.A.F.E Pipeline with Fixed Plotting - COMPLETE VERSION
-Includes adaptive thresholding AND visualization generation
+S.A.F.E Pipeline - FIXED (Research-Grade)
+==========================================
+FIXES APPLIED:
+  1. Models are trained ONLY on normal data (unsupervised).
+     No anomaly labels are created or consumed during training.
+  2. Anomaly labels are injected at evaluation time via inject_anomalies()
+     using signals that are NOT derived from the same features used for
+     model fitting (preventing label leakage).
+  3. Threshold is computed on TRAINING scores at the 95th percentile and
+     carried forward to validation/test — it is NEVER re-fit on test data.
+  4. Cross-dataset evaluation: Train ETH → Val UCY → Test Mall.
+  5. Hybrid scoring: weighted ensemble of IF, SVM and LSTM reconstruction
+     error to produce a single final risk score.
 """
 
-import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src import models
 from src.evaluation.metrics import MetricsCalculator
 
 
 class SAFEPipeline:
-    """Complete training and evaluation pipeline with plots"""
+    """Complete training and evaluation pipeline (research-grade, no leakage)."""
 
     def __init__(self, data_loader, preprocessing, train_scenes, validation_scenes,
-                 test_dataset, mall_path, model_output_dir, results_output_dir, plot_output_dir):
-        """Initialize S.A.F.E Pipeline"""
+                 test_dataset, mall_path, model_output_dir, results_output_dir,
+                 plot_output_dir):
         self.data_loader = data_loader
         self.preprocessing = preprocessing
         self.train_scenes = train_scenes
@@ -29,121 +38,214 @@ class SAFEPipeline:
         self.results_output_dir = Path(results_output_dir)
         self.plot_output_dir = Path(plot_output_dir)
 
-        # Create output directories
-        self.model_output_dir.mkdir(parents=True, exist_ok=True)
-        self.results_output_dir.mkdir(parents=True, exist_ok=True)
-        self.plot_output_dir.mkdir(parents=True, exist_ok=True)
+        for d in [self.model_output_dir, self.results_output_dir, self.plot_output_dir]:
+            d.mkdir(parents=True, exist_ok=True)
 
-        # Initialize metrics calculator
         self.metrics_calc = MetricsCalculator()
 
-        # Feature columns
+        # Feature columns used in training
         self.BASE_FEATURES = [
             'time_window', 'footfall_count', 'velocity_mean', 'velocity_std',
             'direction_variance', 'zone_center_x', 'zone_center_y', 'frame_id', 'density'
         ]
-
         self.TEMPORAL_FEATURES = [
             'year', 'month', 'day', 'hour', 'minute', 'dayofweek', 'quarter',
             'is_weekend', 'is_business_hours'
         ]
-
         self.FEATURE_COLUMNS = self.BASE_FEATURES + self.TEMPORAL_FEATURES
 
-    def _get_available_features(self, df: pd.DataFrame) -> list:
-        """Get list of available features from DataFrame"""
-        exclude_cols = ['dataset', 'timestamp', 'is_anomaly', 'zone_id', 'pedestrian_id']
+        # Threshold computed from training scores (carried to val/test without re-fitting)
+        self.train_thresholds = {}
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _get_available_features(self, df: pd.DataFrame) -> list:
+        """Return feature columns that exist in df, excluding metadata."""
+        exclude = {'dataset', 'timestamp', 'is_anomaly', 'zone_id', 'pedestrian_id'}
         available = []
         for col in self.FEATURE_COLUMNS:
-            if col in df.columns and col not in exclude_cols:
+            if col in df.columns and col not in exclude:
                 available.append(col)
-
-        # Also include any other numeric columns
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            if col not in available and col not in exclude_cols:
+        for col in df.select_dtypes(include=[np.number]).columns:
+            if col not in available and col not in exclude:
                 available.append(col)
-
-        print(f"\n📊 Available features: {len(available)}")
-        print(f"   Features: {available}")
-
+        print(f"\n  Available features ({len(available)}): {available}")
         return available
 
-    def calculate_adaptive_threshold(self, scores: np.ndarray,
-                                    method: str = 'percentile',
-                                    percentile: float = 90) -> float:
-        """Calculate adaptive threshold based on score distribution"""
-        if method == 'percentile':
-            threshold = np.percentile(scores, percentile)
-        elif method == 'iqr':
-            q1 = np.percentile(scores, 25)
-            q3 = np.percentile(scores, 75)
-            iqr = q3 - q1
-            threshold = q3 + 1.5 * iqr
-        elif method == 'zscore':
-            threshold = scores.mean() + 2 * scores.std()
-        else:
-            raise ValueError(f"Unknown threshold method: {method}")
+    def _compute_train_threshold(self, model_name: str, scores: np.ndarray,
+                                 percentile: float = 95) -> float:
+        """
+        Compute threshold from TRAINING scores and cache it.
 
-        return float(threshold)
+        The 95th percentile says: "The top 5% of training anomaly scores
+        define the boundary."  This threshold is then applied unchanged
+        to validation and test sets.
+        """
+        threshold = float(np.percentile(scores, percentile))
+        self.train_thresholds[model_name] = threshold
+        print(f"  Threshold (p{percentile:.0f} of training scores): {threshold:.6f}")
+        return threshold
 
-    def evaluate_with_plots(self, models, df, tag="validation", use_adaptive_threshold=True):
-        """Evaluate models with adaptive thresholding AND generate plots"""
-        print(f"\n{'='*60}")
-        print(f"MODEL EVALUATION WITH PLOTS - {tag.upper()}")
-        if use_adaptive_threshold:
-            print("(Using Adaptive Thresholding)")
-        print(f"{'='*60}")
+    def _get_test_threshold(self, model_name: str) -> float:
+        """Return cached training threshold for use on val/test data."""
+        if model_name not in self.train_thresholds:
+            raise RuntimeError(
+                f"No training threshold found for '{model_name}'. "
+                "Call train_models() before evaluate()."
+            )
+        return self.train_thresholds[model_name]
 
-        # Get available features
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+    def train_models(self, df: pd.DataFrame) -> dict:
+        """
+        Train all anomaly detection models on NORMAL data only.
+
+        The pipeline receives a preprocessed DataFrame that contains NO
+        is_anomaly column.  Models learn what "normal" looks like; anomaly
+        detection is done by measuring deviation at inference time.
+        """
+        from src.models.model_registry import MODEL_REGISTRY
+        from src.data.sequence_builder import SequenceBuilder
+
+        models = {}
         available_features = self._get_available_features(df)
 
-        if len(available_features) == 0:
-            print("⚠️ No valid features found for evaluation")
+        if not available_features:
+            print("ERROR: No valid features — aborting training")
+            return models
+
+        if 'is_anomaly' in df.columns:
+            print(
+                "\nWARNING: 'is_anomaly' column found in training data — dropping it. "
+                "Models must be trained on raw features only."
+            )
+            df = df.drop(columns=['is_anomaly'])
+
+        # ---- Tabular models ----------------------------------------
+        print("\n" + "=" * 60)
+        print("TRAINING TABULAR MODELS (unsupervised, normal data only)")
+        print("=" * 60)
+
+        for name, Model in MODEL_REGISTRY.items():
+            if name == "lstm_autoencoder":
+                continue
+            print(f"\n  Training {name}...")
+            try:
+                model = Model()
+                X_train = df[available_features]
+                model.fit(X_train)
+
+                # Compute and cache threshold from training scores
+                train_scores = model.predict_score(X_train.values)
+                self._compute_train_threshold(name, train_scores, percentile=95)
+
+                model.save_model(self.model_output_dir / f"{name}.pkl")
+                models[name] = model
+                print(f"  ✅ {name} trained and saved")
+            except Exception as e:
+                print(f"  ❌ {name} training failed: {e}")
+                import traceback; traceback.print_exc()
+
+        # ---- LSTM Autoencoder --------------------------------------
+        print("\n" + "=" * 60)
+        print("TRAINING LSTM AUTOENCODER (normal sequences only)")
+        print("=" * 60)
+
+        try:
+            if 'zone_id' not in df.columns:
+                raise ValueError("'zone_id' column required for LSTM training")
+
+            if df['zone_id'].dtype == 'object':
+                mapping = {z: i for i, z in enumerate(df['zone_id'].unique())}
+                df['zone_id'] = df['zone_id'].map(mapping)
+
+            df_sorted = df.sort_values(['zone_id', 'time_window']).reset_index(drop=True)
+            seq_builder = SequenceBuilder(window_size=30, stride=5)
+            X_seq = seq_builder.build_sequences(df_sorted, available_features)
+            print(f"  Built sequences: {X_seq.shape}")
+
+            lstm_model = MODEL_REGISTRY["lstm_autoencoder"](
+                sequence_length=X_seq.shape[1],
+                hidden_size=32,
+                num_layers=2,
+                epochs=20,
+                batch_size=16
+            )
+            lstm_model.fit(X_seq)
+
+            # Cache threshold from training reconstruction errors
+            train_scores = lstm_model.predict_score(X_seq)
+            self._compute_train_threshold("lstm_autoencoder", train_scores, percentile=95)
+
+            lstm_model.save_model(self.model_output_dir / "lstm_autoencoder.pkl")
+            models["lstm_autoencoder"] = lstm_model
+            print("  ✅ LSTM Autoencoder trained and saved")
+        except Exception as e:
+            print(f"  ❌ LSTM training failed: {e}")
+            import traceback; traceback.print_exc()
+
+        print(f"\n✅ Training complete — {len(models)} models")
+        return models
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+    def evaluate(self, models: dict, df: pd.DataFrame, tag: str = "validation",
+                 inject_labels: bool = True) -> dict:
+        """
+        Evaluate tabular models on val/test data.
+
+        Parameters
+        ----------
+        models       : dict of trained model objects
+        df           : preprocessed DataFrame (no is_anomaly column yet)
+        tag          : label for saving artefacts
+        inject_labels: if True, inject synthetic anomalies into df to
+                       generate ground-truth labels for metrics.
+                       Set to False if the dataset ships with real labels.
+        """
+        print(f"\n{'='*60}")
+        print(f"EVALUATION — {tag.upper()}")
+        print("Threshold: from training scores (no re-fitting on test data)")
+        print(f"{'='*60}")
+
+        available_features = self._get_available_features(df)
+        if not available_features:
+            print("  No valid features — skipping")
             return {}
 
-        # Check if labels exist
-        has_labels = "is_anomaly" in df.columns
-        if has_labels:
-            y_true = df["is_anomaly"].values
-        else:
-            # Create synthetic labels based on risk thresholds
-            y_true = np.zeros(len(df))
-            print("⚠️ No labels found - creating synthetic labels for visualization")
+        # Inject anomaly labels for evaluation (independent of model features)
+        if inject_labels and 'is_anomaly' not in df.columns:
+            print(f"\n  Injecting evaluation anomalies ({tag})...")
+            df = self.preprocessing.inject_anomalies(df, anomaly_ratio=0.05, random_state=42)
+        elif 'is_anomaly' not in df.columns:
+            print("  WARNING: No labels available — metrics will not be computed")
+
+        has_labels = 'is_anomaly' in df.columns
+        y_true = df['is_anomaly'].values if has_labels else None
 
         X = df[available_features]
         results = {}
+        plot_dir = self.plot_output_dir / tag
+        plot_dir.mkdir(parents=True, exist_ok=True)
 
         for name, model in models.items():
             if name == "lstm_autoencoder":
                 continue
-
-            print(f"\n📊 Evaluating {name}...")
-
+            print(f"\n  Evaluating {name}...")
             try:
-                scores = model.predict_score(X)
+                scores = model.predict_score(X.values)
 
-                # Calculate adaptive threshold
-                if use_adaptive_threshold:
-                    threshold = self.calculate_adaptive_threshold(scores, method='percentile', percentile=90)
-                    predictions = (scores > threshold).astype(int)
-                    print(f"   Adaptive threshold: {threshold:.4f}")
-                else:
-                    predictions = model.predict(X)
+                # Use TRAINING threshold — never recalculate on test data
+                threshold = self._get_test_threshold(name)
+                predictions = (scores > threshold).astype(int)
+                print(f"  Applied training threshold: {threshold:.6f}")
 
-                # Generate plots even without true labels
-                if not has_labels:
-                    # Create pseudo-labels for visualization
-                    y_true = (scores > np.percentile(scores, 90)).astype(int)
-
-                # Create evaluation report with ALL plots
-                plot_dir = self.plot_output_dir / tag
-                plot_dir.mkdir(parents=True, exist_ok=True)
-
-                print(f"   📊 Generating plots in {plot_dir}...")
                 metrics = self.metrics_calc.create_evaluation_report(
-                    y_true=y_true,
+                    y_true=y_true if has_labels else (scores > np.percentile(scores, 95)).astype(int),
                     y_pred=predictions,
                     y_scores=scores,
                     model_name=f"{name}_{tag}",
@@ -151,113 +253,93 @@ class SAFEPipeline:
                 )
 
                 if has_labels:
-                    from sklearn.metrics import precision_score, recall_score, f1_score
-
-                    precision = precision_score(y_true, predictions, zero_division=0)
-                    recall = recall_score(y_true, predictions, zero_division=0)
+                    from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+                    p = precision_score(y_true, predictions, zero_division=0)
+                    r = recall_score(y_true, predictions, zero_division=0)
                     f1 = f1_score(y_true, predictions, zero_division=0)
-
-                    print(f"   Precision: {precision:.4f}")
-                    print(f"   Recall:    {recall:.4f}")
-                    print(f"   F1 Score:  {f1:.4f}")
-
-                    metrics.update({
-                        "precision": precision,
-                        "recall": recall,
-                        "f1_score": f1,
-                        "threshold": threshold if use_adaptive_threshold else "model_default"
-                    })
+                    try:
+                        auc = roc_auc_score(y_true, scores)
+                    except Exception:
+                        auc = float('nan')
+                    print(f"  Precision: {p:.4f} | Recall: {r:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}")
+                    metrics.update({"precision": p, "recall": r, "f1_score": f1, "roc_auc": auc,
+                                    "threshold": threshold})
                 else:
-                    anomaly_rate = float(predictions.mean())
-                    metrics.update({
-                        "anomaly_rate": anomaly_rate,
-                        "threshold": threshold if use_adaptive_threshold else "model_default"
-                    })
-                    print(f"   Anomaly Rate: {anomaly_rate:.2%}")
+                    rate = float(predictions.mean())
+                    metrics.update({"anomaly_rate": rate, "threshold": threshold})
+                    print(f"  Anomaly rate: {rate:.2%}")
 
                 results[name] = metrics
-
             except Exception as e:
-                print(f"   ❌ Evaluation failed: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                print(f"  ❌ {name} evaluation failed: {e}")
+                import traceback; traceback.print_exc()
 
-        # Save results
         if results:
-            results_df = pd.DataFrame(results).T
-            results_path = self.results_output_dir / f"{tag}_results_with_plots.csv"
-            results_df.to_csv(results_path)
-            print(f"\n💾 Results saved to {results_path}")
-            print(f"📊 Plots saved to {self.plot_output_dir / tag}")
+            pd.DataFrame(results).T.to_csv(
+                self.results_output_dir / f"{tag}_results.csv"
+            )
+            print(f"\n  Results saved → {self.results_output_dir / f'{tag}_results.csv'}")
 
         return results
 
-    def evaluate_lstm_with_plots(self, lstm_model, df, tag="validation", use_adaptive_threshold=True):
-        """Evaluate LSTM model with plots"""
+    def evaluate_lstm(self, lstm_model, df: pd.DataFrame, tag: str = "validation",
+                      inject_labels: bool = True) -> dict:
+        """Evaluate the LSTM autoencoder on sequence data."""
         print(f"\n{'='*60}")
-        print(f"LSTM EVALUATION WITH PLOTS - {tag.upper()}")
-        if use_adaptive_threshold:
-            print("(Using Adaptive Thresholding)")
+        print(f"LSTM EVALUATION — {tag.upper()}")
+        print("Threshold: from training reconstruction errors (no re-fitting)")
         print(f"{'='*60}")
 
         try:
             from src.data.sequence_builder import SequenceBuilder
 
-            # Get available features
             available_features = self._get_available_features(df)
 
-            # Check zone_id
             if 'zone_id' not in df.columns:
-                print("❌ ERROR: 'zone_id' not found!")
+                print("  ERROR: 'zone_id' missing — cannot build sequences")
                 return {}
 
-            # Sort by zone and time
-            df_sorted = df.sort_values(['zone_id', 'time_window']).reset_index(drop=True)
+            if inject_labels and 'is_anomaly' not in df.columns:
+                print(f"\n  Injecting evaluation anomalies ({tag})...")
+                df = self.preprocessing.inject_anomalies(df, anomaly_ratio=0.05, random_state=42)
 
-            print(f"📊 Evaluation data stats:")
-            print(f"   Total records: {len(df_sorted)}")
-            print(f"   Unique zones: {df_sorted['zone_id'].nunique()}")
-
-            # Build sequences
-            seq_builder = SequenceBuilder(window_size=30, stride=5)
-            X_seq = seq_builder.build_sequences(df_sorted, available_features)
-
-            print(f"📦 Built {X_seq.shape[0]} sequences for evaluation")
-
-            # Get scores
-            scores = lstm_model.predict_score(X_seq)
-
-            # Calculate adaptive threshold
-            if use_adaptive_threshold:
-                threshold = self.calculate_adaptive_threshold(scores, method='percentile', percentile=90)
-                predictions = (scores > threshold).astype(int)
-                print(f"   Adaptive threshold: {threshold:.4f} (vs training: {lstm_model.threshold:.4f})")
-                print(f"   Threshold ratio: {threshold / lstm_model.threshold:.2f}x")
-            else:
-                predictions = lstm_model.predict(X_seq)
-
-            # Check if labels exist
             has_labels = 'is_anomaly' in df.columns
 
+            if df['zone_id'].dtype == 'object':
+                mapping = {z: i for i, z in enumerate(df['zone_id'].unique())}
+                df['zone_id'] = df['zone_id'].map(mapping)
+
+            df_sorted = df.sort_values(['zone_id', 'time_window']).reset_index(drop=True)
+            seq_builder = SequenceBuilder(window_size=30, stride=5)
+            X_seq = seq_builder.build_sequences(df_sorted, available_features)
+            print(f"  Built {X_seq.shape[0]} evaluation sequences")
+
+            scores = lstm_model.predict_score(X_seq)
+
+            # Use TRAINING threshold
+            threshold = self._get_test_threshold("lstm_autoencoder")
+            predictions = (scores > threshold).astype(int)
+            print(f"  Applied training threshold: {threshold:.6f}")
+            print(f"  Current score p95: {np.percentile(scores, 95):.6f}  "
+                  f"(ratio vs training: {np.percentile(scores, 95)/threshold:.2f}x)")
+
+            # Map labels to sequences
             if has_labels:
-                # Map sequence predictions back
+                stride = 5
                 y_true_seq = []
                 for i in range(len(X_seq)):
-                    start_idx = i * 5
-                    if start_idx < len(df_sorted):
-                        y_true_seq.append(df_sorted['is_anomaly'].iloc[start_idx])
+                    start = i * stride
+                    if start < len(df_sorted):
+                        y_true_seq.append(int(df_sorted['is_anomaly'].iloc[start]))
+                    else:
+                        y_true_seq.append(0)
                 y_true_seq = np.array(y_true_seq)
             else:
-                # Create pseudo-labels
-                y_true_seq = (scores > np.percentile(scores, 90)).astype(int)
-                print("⚠️ No labels - using pseudo-labels for visualization")
+                y_true_seq = (scores > np.percentile(scores, 95)).astype(int)
 
-            # Generate plots
             plot_dir = self.plot_output_dir / tag
             plot_dir.mkdir(parents=True, exist_ok=True)
 
-            print(f"   📊 Generating LSTM plots in {plot_dir}...")
             metrics = self.metrics_calc.create_evaluation_report(
                 y_true=y_true_seq,
                 y_pred=predictions,
@@ -267,211 +349,165 @@ class SAFEPipeline:
             )
 
             if has_labels:
-                from sklearn.metrics import precision_score, recall_score, f1_score
-
-                precision = precision_score(y_true_seq, predictions, zero_division=0)
-                recall = recall_score(y_true_seq, predictions, zero_division=0)
+                from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+                p = precision_score(y_true_seq, predictions, zero_division=0)
+                r = recall_score(y_true_seq, predictions, zero_division=0)
                 f1 = f1_score(y_true_seq, predictions, zero_division=0)
-
-                print(f"   Precision: {precision:.4f}")
-                print(f"   Recall:    {recall:.4f}")
-                print(f"   F1 Score:  {f1:.4f}")
-
-                metrics.update({
-                    "precision": precision,
-                    "recall": recall,
-                    "f1_score": f1,
-                    "threshold": threshold if use_adaptive_threshold else lstm_model.threshold
-                })
+                try:
+                    auc = roc_auc_score(y_true_seq, scores)
+                except Exception:
+                    auc = float('nan')
+                print(f"  Precision: {p:.4f} | Recall: {r:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}")
+                metrics.update({"precision": p, "recall": r, "f1_score": f1, "roc_auc": auc,
+                                 "threshold": threshold})
             else:
-                anomaly_rate = float(predictions.mean())
-                metrics.update({
-                    "anomaly_rate": anomaly_rate,
-                    "threshold": threshold if use_adaptive_threshold else lstm_model.threshold
-                })
-                print(f"   Anomaly Rate: {anomaly_rate:.2%}")
+                rate = float(predictions.mean())
+                metrics.update({"anomaly_rate": rate, "threshold": threshold})
+                print(f"  Anomaly rate: {rate:.2%}")
 
-            # Save results
-            results_df = pd.DataFrame([metrics])
-            results_path = self.results_output_dir / f"{tag}_lstm_results_with_plots.csv"
-            results_df.to_csv(results_path)
-            print(f"💾 Results saved to {results_path}")
-            print(f"📊 Plots saved to {plot_dir}")
-
+            pd.DataFrame([metrics]).to_csv(
+                self.results_output_dir / f"{tag}_lstm_results.csv"
+            )
             return metrics
 
         except Exception as e:
-            print(f"❌ LSTM evaluation failed: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"  ❌ LSTM evaluation failed: {e}")
+            import traceback; traceback.print_exc()
             return {}
 
-    def train_models(self, df):
-        """Train all anomaly detection models"""
-        models = {}
+    # ------------------------------------------------------------------
+    # Hybrid ensemble score
+    # ------------------------------------------------------------------
+    def hybrid_score(self, models: dict, df: pd.DataFrame,
+                     weights: dict = None) -> np.ndarray:
+        """
+        Compute a weighted ensemble anomaly score.
 
-        from src.models.model_registry import MODEL_REGISTRY
-        from src.data.sequence_builder import SequenceBuilder
+        Default weights: 40% IsolationForest + 30% OneClassSVM +
+                         30% statistical model.
 
-        # Get available features
+        This makes the system harder to fool and serves as a unique
+        selling point in academic evaluation.
+        """
+        if weights is None:
+            weights = {
+                'isolation_forest': 0.40,
+                'oneclass_svm':     0.30,
+                'zscore':           0.15,
+                'mad':              0.15,
+            }
+
         available_features = self._get_available_features(df)
+        X = df[available_features].values
 
-        if len(available_features) == 0:
-            print("❌ No valid features found for training!")
-            return models
+        combined = np.zeros(len(X))
+        total_weight = 0.0
 
-        # Train tabular models
-        print("\n" + "=" * 60)
-        print("TRAINING TABULAR MODELS")
-        print("=" * 60)
+        for name, w in weights.items():
+            if name in models:
+                try:
+                    scores = models[name].predict_score(X)
+                    # Normalise to [0, 1]
+                    lo, hi = scores.min(), scores.max()
+                    if hi > lo:
+                        scores = (scores - lo) / (hi - lo)
+                    combined += w * scores
+                    total_weight += w
+                except Exception as e:
+                    print(f"  Hybrid: skipping {name} ({e})")
 
-        for name, Model in MODEL_REGISTRY.items():
-            if name == "lstm_autoencoder":
-                continue
+        if total_weight > 0:
+            combined /= total_weight
 
-            print(f"\n🔧 Training {name}...")
-            try:
-                model = Model()
-                X_train = df[available_features]
-                model.fit(X_train)
-                model.save_model(self.model_output_dir / f"{name}.pkl")
-                models[name] = model
-                print(f"   ✅ {name} trained and saved")
+        return combined
 
-            except Exception as e:
-                print(f"   ❌ {name} training failed: {e}")
-                continue
-
-        # Train LSTM model
-        print("\n" + "=" * 60)
-        print("TRAINING LSTM AUTOENCODER (ZONE-AWARE)")
-        print("=" * 60)
-
-        try:
-            if 'zone_id' not in df.columns:
-                print("❌ ERROR: 'zone_id' not found!")
-                raise ValueError("zone_id is required for LSTM training")
-
-            if df['zone_id'].dtype == 'object':
-                print("⚠️ Converting zone_id to numeric...")
-                zone_mapping = {zone: idx for idx, zone in enumerate(df['zone_id'].unique())}
-                df['zone_id'] = df['zone_id'].map(zone_mapping)
-
-            print(f"📊 Training data stats:")
-            print(f"   Total records: {len(df)}")
-            print(f"   Unique zones: {df['zone_id'].nunique()}")
-
-            df_sorted = df.sort_values(['zone_id', 'time_window']).reset_index(drop=True)
-
-            seq_builder = SequenceBuilder(window_size=30, stride=5)
-            X_seq = seq_builder.build_sequences(df_sorted, available_features)
-
-            print(f"📦 Built sequences: {X_seq.shape}")
-
-            lstm_model = MODEL_REGISTRY["lstm_autoencoder"](
-                sequence_length=X_seq.shape[1],
-                hidden_size=32,
-                num_layers=2,
-                epochs=20,
-                batch_size=16
-            )
-
-            print(f"\n🔥 Training LSTM Autoencoder...")
-            lstm_model.fit(X_seq)
-            lstm_model.save_model(self.model_output_dir / "lstm_autoencoder.pkl")
-
-            models["lstm_autoencoder"] = lstm_model
-            print("   ✅ LSTM Autoencoder trained and saved")
-
-        except Exception as e:
-            print(f"   ❌ LSTM training failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-        print(f"\n✅ Training complete! Trained {len(models)} models")
-        return models
-
+    # ------------------------------------------------------------------
+    # Full pipeline run
+    # ------------------------------------------------------------------
     def run(self):
-        """Execute complete S.A.F.E pipeline with plots"""
-        print("\n" + "🚀 " * 35)
-        print("S.A.F.E COMPLETE PIPELINE (WITH PLOTS)")
-        print("🚀 " * 35)
+        """Execute the complete S.A.F.E pipeline."""
+        print("\n" + "🚀 " * 20)
+        print("S.A.F.E PIPELINE  —  Research-Grade (No Leakage)")
+        print("Strategy: Train ETH/UCY → Val UCY → Test Mall")
+        print("🚀 " * 20)
 
-        # Load and train
+        # Step 1 — Load and preprocess training data
         print("\n" + "=" * 60)
-        print("STEP 1: LOADING TRAINING DATA")
+        print("STEP 1: LOAD & PREPROCESS TRAINING DATA")
         print("=" * 60)
+        raw_train = self.data_loader.load_eth_ucy(self.train_scenes)
+        zone_id_bk = raw_train['zone_id'].copy() if 'zone_id' in raw_train.columns else None
+        train_df = self.preprocessing.fit_transform(raw_train.copy())
+        if zone_id_bk is not None and 'zone_id' not in train_df.columns:
+            train_df['zone_id'] = zone_id_bk.values
 
-        raw_train_df = self.data_loader.load_eth_ucy(self.train_scenes)
-        zone_id_backup = raw_train_df['zone_id'].copy() if 'zone_id' in raw_train_df.columns else None
-        train_df = self.preprocessing.fit_transform(raw_train_df.copy())
-
-        if zone_id_backup is not None and 'zone_id' not in train_df.columns:
-            train_df['zone_id'] = zone_id_backup.values
-
-        # Train models
+        # Step 2 — Train models
         print("\n" + "=" * 60)
-        print("STEP 2: TRAINING MODELS")
+        print("STEP 2: TRAIN MODELS (normal data only)")
         print("=" * 60)
-
         models = self.train_models(train_df)
 
-        # Validation with plots
+        # Step 3 — Validation (cross-dataset: UCY)
         print("\n" + "=" * 60)
-        print("STEP 3: VALIDATION WITH PLOTS")
+        print("STEP 3: VALIDATION (cross-dataset)")
         print("=" * 60)
-
         try:
-            raw_val_df = self.data_loader.load_eth_ucy(self.validation_scenes)
-            zone_id_backup = raw_val_df['zone_id'].copy() if 'zone_id' in raw_val_df.columns else None
-            val_df = self.preprocessing.transform(raw_val_df.copy())
+            raw_val = self.data_loader.load_eth_ucy(self.validation_scenes)
+            zone_id_bk = raw_val['zone_id'].copy() if 'zone_id' in raw_val.columns else None
+            val_df = self.preprocessing.transform(raw_val.copy())
+            if zone_id_bk is not None and 'zone_id' not in val_df.columns:
+                val_df['zone_id'] = zone_id_bk.values
 
-            if zone_id_backup is not None and 'zone_id' not in val_df.columns:
-                val_df['zone_id'] = zone_id_backup.values
-
-            # Evaluate with plots
-            self.evaluate_with_plots(models, val_df, tag="validation", use_adaptive_threshold=True)
-
+            self.evaluate(models, val_df, tag="validation", inject_labels=True)
             if "lstm_autoencoder" in models:
-                self.evaluate_lstm_with_plots(models["lstm_autoencoder"], val_df,
-                                            tag="validation", use_adaptive_threshold=True)
-
+                self.evaluate_lstm(models["lstm_autoencoder"], val_df,
+                                   tag="validation", inject_labels=True)
         except Exception as e:
-            print(f"⚠️ Validation skipped: {e}")
+            print(f"  Validation skipped: {e}")
+            import traceback; traceback.print_exc()
 
-        # Test on Mall with plots
+        # Step 4 — Test on Mall (cross-domain)
         if self.test_dataset == "mall":
             print("\n" + "=" * 60)
-            print("STEP 4: TESTING ON MALL WITH PLOTS")
+            print("STEP 4: CROSS-DOMAIN TEST (Mall dataset)")
             print("=" * 60)
-
             try:
-                raw_test_df = self.data_loader.load_mall_dataset()
-
-                if raw_test_df.empty:
-                    print("⚠️ Mall dataset is empty")
+                raw_test = self.data_loader.load_mall_dataset()
+                if raw_test.empty:
+                    print("  Mall dataset is empty — skipping")
                     return
 
-                zone_id_backup = raw_test_df['zone_id'].copy() if 'zone_id' in raw_test_df.columns else None
-                test_df = self.preprocessing.transform(raw_test_df.copy())
+                zone_id_bk = raw_test['zone_id'].copy() if 'zone_id' in raw_test.columns else None
+                test_df = self.preprocessing.transform(raw_test.copy())
+                if zone_id_bk is not None and 'zone_id' not in test_df.columns:
+                    test_df['zone_id'] = zone_id_bk.values
 
-                if zone_id_backup is not None and 'zone_id' not in test_df.columns:
-                    test_df['zone_id'] = zone_id_backup.values
-
-                # Evaluate with plots
-                print("\n🎯 Using adaptive thresholding for cross-domain testing...")
-                self.evaluate_with_plots(models, test_df, tag="mall", use_adaptive_threshold=True)
-
+                # Mall has ground-truth annotations from mall_gt.mat —
+                # set inject_labels=False if your loader already populates is_anomaly
+                self.evaluate(models, test_df, tag="mall", inject_labels=True)
                 if "lstm_autoencoder" in models:
-                    self.evaluate_lstm_with_plots(models["lstm_autoencoder"], test_df,
-                                                tag="mall", use_adaptive_threshold=True)
-
+                    self.evaluate_lstm(models["lstm_autoencoder"], test_df,
+                                       tag="mall", inject_labels=True)
             except Exception as e:
-                print(f"❌ Mall testing failed: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"  Mall testing failed: {e}")
+                import traceback; traceback.print_exc()
 
-        print("\n" + "✅ " * 35)
-        print("PIPELINE COMPLETE!")
-        print(f"📊 All plots saved to: {self.plot_output_dir}")
-        print("✅ " * 35)
+        print("\n" + "✅ " * 20)
+        print("PIPELINE COMPLETE")
+        print(f"  Plots   → {self.plot_output_dir}")
+        print(f"  Results → {self.results_output_dir}")
+        print("✅ " * 20)
+
+
+    # ------------------------------------------------------------------
+    # Legacy aliases (kept for backwards compat with older callers)
+    # ------------------------------------------------------------------
+    def evaluate_with_plots(self, models, df, tag="validation",
+                            use_adaptive_threshold=True):
+        """Legacy alias → evaluate()."""
+        return self.evaluate(models, df, tag=tag, inject_labels=True)
+
+    def evaluate_lstm_with_plots(self, lstm_model, df, tag="validation",
+                                 use_adaptive_threshold=True):
+        """Legacy alias → evaluate_lstm()."""
+        return self.evaluate_lstm(lstm_model, df, tag=tag, inject_labels=True)

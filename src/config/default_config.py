@@ -4,11 +4,12 @@ Centralized configuration for paths and settings
 """
 
 from pathlib import Path
+import os
 
 # ============= PATHS =============
 
-# Base project directory
-PROJECT_ROOT = Path("C:/Users/somas/PycharmProjects/S.A.F.E")
+# Base project directory (auto-detect for portability)
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 # Models directory (where your trained models are stored)
 MODELS_PATH = PROJECT_ROOT / "scripts" / "models"
@@ -17,9 +18,14 @@ MODELS_PATH = PROJECT_ROOT / "scripts" / "models"
 DATA_PATH = PROJECT_ROOT / "data" / "processed"
 RAW_DATA_PATH = PROJECT_ROOT / "data" / "raw"
 
+# Mall dataset path
+MALL_PATH = RAW_DATA_PATH / "mall_dataset"
+ETH_UCY_PATH = RAW_DATA_PATH / "eth_ucy"
+
 # Create directories if they don't exist
 MODELS_PATH.mkdir(parents=True, exist_ok=True)
 DATA_PATH.mkdir(parents=True, exist_ok=True)
+ETH_UCY_PATH.mkdir(parents=True, exist_ok=True)
 
 # ============= API SETTINGS =============
 
@@ -199,7 +205,9 @@ DEFAULT_CONFIG = {
         "project_root": PROJECT_ROOT,
         "models": MODELS_PATH,
         "data": DATA_PATH,
-        "raw": RAW_DATA_PATH
+        "raw": RAW_DATA_PATH,
+        "mall": MALL_PATH,
+        "eth_ucy": ETH_UCY_PATH
     },
     "grid_size": GRID_SIZE,
     "time_window": TIME_WINDOW,
@@ -265,6 +273,8 @@ if __name__ == "__main__":
     print(f"Project Root: {PROJECT_ROOT}")
     print(f"Models Path: {MODELS_PATH}")
     print(f"Data Path: {DATA_PATH}")
+    print(f"ETH/UCY Path: {ETH_UCY_PATH}")
+    print(f"Mall Path: {MALL_PATH}")
     print(f"API URL: {API_BASE_URL}")
     print(f"\nAvailable Models: {list_available_models()}")
 
