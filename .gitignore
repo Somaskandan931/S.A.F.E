@@ -140,12 +140,11 @@ htmlcov/
 # ===============================
 docker-compose.override.yml
 .dockerignore
-
-# ===============================
-# S.A.F.E Specific: Keep source code, exclude data and trained models
-# ===============================
-# Keep all Python source files in src/
-# !src/**/*.py
+===============================
+S.A.F.E Specific: Keep source code, exclude data and trained models
+===============================
+Keep all Python source files in src/
+!src/**/*.py
 
 # Exclude processed results but keep the directory structure
 results/analysis/
