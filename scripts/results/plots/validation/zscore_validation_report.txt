@@ -1,0 +1,22 @@
+
+============================================================
+Performance Report: zscore_validation
+============================================================
+
+Classification Metrics:
+  Precision:        1.0000
+  Recall:           1.0000
+  F1 Score:         1.0000
+  Accuracy:         1.0000
+
+Threshold Metrics:
+  ROC AUC:          1.0000
+  Avg Precision:    1.0000
+
+Confusion Matrix:
+  True Positives:   1362
+  False Positives:  0
+  True Negatives:   12443
+  False Negatives:  0
+
+============================================================

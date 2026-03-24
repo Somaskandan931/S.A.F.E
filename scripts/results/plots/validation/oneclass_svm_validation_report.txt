@@ -1,0 +1,22 @@
+
+============================================================
+Performance Report: oneclass_svm_validation
+============================================================
+
+Classification Metrics:
+  Precision:        1.0000
+  Recall:           1.0000
+  F1 Score:         1.0000
+  Accuracy:         1.0000
+
+Threshold Metrics:
+  ROC AUC:          1.0000
+  Avg Precision:    1.0000
+
+Confusion Matrix:
+  True Positives:   1381
+  False Positives:  0
+  True Negatives:   12424
+  False Negatives:  0
+
+============================================================
