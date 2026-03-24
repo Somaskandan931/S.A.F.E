@@ -30,17 +30,20 @@ build/
 streamlit.log
 
 # ===============================
-# ML Models & Artifacts (Keep code, exclude trained models)
+# ML Models & Artifacts (Trained models only, not source code)
 # ===============================
-# Exclude all trained models but keep the model code files
-scripts/models/
-models/
-checkpoints/
+# Exclude trained model files (weights), keep source code
+scripts/models/*.pkl
+scripts/models/*.joblib
+scripts/models/*.pt
+scripts/models/*.pth
+models/*.pkl
+models/*.joblib
+*.pkl
+*.joblib
 *.pt
 *.pth
 *.h5
-*.joblib
-*.pkl
 *.onnx
 
 # ===============================
@@ -55,11 +58,8 @@ raw_data/
 processed_data/
 
 # Keep the data loader code, exclude the actual data files
-# The following directories contain actual datasets - DO NOT COMMIT
 eth_ucy/
 mall_dataset/
-!data/raw/eth_ucy/.gitkeep
-!data/raw/mall_dataset/.gitkeep
 
 # ===============================
 # Logs & Outputs
@@ -127,31 +127,3 @@ site/
 htmlcov/
 .pytest_cache/
 .tox/
-
-# ===============================
-# PyTorch & Deep Learning
-# ===============================
-*.caffemodel
-*.prototxt
-*.npy
-
-# ===============================
-# Docker
-# ===============================
-docker-compose.override.yml
-.dockerignore
-===============================
-S.A.F.E Specific: Keep source code, exclude data and trained models
-===============================
-Keep all Python source files in src/
-!src/**/*.py
-
-# Exclude processed results but keep the directory structure
-results/analysis/
-results/plots/
-!results/analysis/.gitkeep
-!results/plots/.gitkeep
-
-# Keep the model definition files, exclude trained weights
-# The model code files are in src/models/ and will be included
-# The trained model files in scripts/models/ are excluded
