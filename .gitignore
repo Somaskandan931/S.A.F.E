@@ -21,6 +21,7 @@ build/
 # Jupyter / Notebooks
 # ===============================
 .ipynb_checkpoints/
+*.ipynb
 
 # ===============================
 # Streamlit
@@ -29,8 +30,10 @@ build/
 streamlit.log
 
 # ===============================
-# ML Models & Artifacts
+# ML Models & Artifacts (Keep code, exclude trained models)
 # ===============================
+# Exclude all trained models but keep the model code files
+scripts/models/
 models/
 checkpoints/
 *.pt
@@ -43,22 +46,20 @@ checkpoints/
 # ===============================
 # Project-Specific Directories (S.A.F.E)
 # ===============================
-data/
+# Exclude data directories but keep empty structure
+data/raw/
+data/processed/
 external/
-
-
-
-# ===============================
-# Data (DO NOT COMMIT RAW DATA)
-# ===============================
 datasets/
 raw_data/
 processed_data/
+
+# Keep the data loader code, exclude the actual data files
+# The following directories contain actual datasets - DO NOT COMMIT
 eth_ucy/
 mall_dataset/
-
-*.tsv
-*.parquet
+!data/raw/eth_ucy/.gitkeep
+!data/raw/mall_dataset/.gitkeep
 
 # ===============================
 # Logs & Outputs
@@ -66,6 +67,8 @@ mall_dataset/
 logs/
 outputs/
 *.log
+results/
+!results/.gitkeep
 
 # ===============================
 # Experiment Tracking
@@ -80,6 +83,7 @@ runs/
 # ===============================
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # ===============================
 # IDEs & Editors
@@ -88,6 +92,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+*~
+*.bak
 
 # ===============================
 # Secrets & Environment Variables
@@ -96,6 +102,8 @@ Thumbs.db
 .env.*
 secrets.yaml
 config/secrets/
+*.key
+*.pem
 
 # ===============================
 # Temporary & Cache
@@ -103,3 +111,48 @@ config/secrets/
 .cache/
 .tmp/
 tmp/
+*.tmp
+*.cache
+
+# ===============================
+# Documentation Builds
+# ===============================
+docs/_build/
+site/
+
+# ===============================
+# Test Coverage
+# ===============================
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# ===============================
+# PyTorch & Deep Learning
+# ===============================
+*.caffemodel
+*.prototxt
+*.npy
+
+# ===============================
+# Docker
+# ===============================
+docker-compose.override.yml
+.dockerignore
+
+# ===============================
+# S.A.F.E Specific: Keep source code, exclude data and trained models
+# ===============================
+# Keep all Python source files in src/
+# !src/**/*.py
+
+# Exclude processed results but keep the directory structure
+results/analysis/
+results/plots/
+!results/analysis/.gitkeep
+!results/plots/.gitkeep
+
+# Keep the model definition files, exclude trained weights
+# The model code files are in src/models/ and will be included
+# The trained model files in scripts/models/ are excluded
