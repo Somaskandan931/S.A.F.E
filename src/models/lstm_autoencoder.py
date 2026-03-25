@@ -1,7 +1,10 @@
 """
-LSTM Autoencoder for S.A.F.E - CLEAN VERSION
+LSTM Autoencoder for S.A.F.E - FIXED VERSION
 =============================================
-FIXED for reliable loading and saving
+FIXES APPLIED:
+  1. Score normalization for consistent thresholds
+  2. Proper save/load of normalization parameters
+  3. Robust error handling
 """
 
 import numpy as np
@@ -80,6 +83,10 @@ class LSTMAutoencoderDetector(BaseAnomalyModel):
         self.scaler_mean: Optional[np.ndarray] = None
         self.scaler_std: Optional[np.ndarray] = None
 
+        # NEW: Store score normalization parameters
+        self.score_min: float = 0.0
+        self.score_max: float = 1.0
+
     # ------------------------------------------------------------------
     def _normalize(self, X: np.ndarray, fit: bool = True) -> np.ndarray:
         """Normalise data using training statistics."""
@@ -145,27 +152,39 @@ class LSTMAutoencoderDetector(BaseAnomalyModel):
                 avg_loss = epoch_loss / len(loader)
                 print(f"    Epoch [{epoch+1}/{self.epochs}], Loss: {avg_loss:.6f}")
 
-        # Compute training reconstruction errors to set threshold
+        # Compute training reconstruction errors
         self.model.eval()
         with torch.no_grad():
             recon = self.model(X_tensor)
             errors = torch.mean((X_tensor - recon) ** 2, dim=(1, 2)).cpu().numpy()
 
-        # Threshold = 95th percentile of training errors
-        self.threshold = float(np.percentile(errors, 95))
+        # NEW: Normalize scores to [0, 1] range for consistent threshold
+        self.score_min = float(errors.min())
+        self.score_max = float(errors.max())
+
+        if self.score_max > self.score_min:
+            errors_norm = (errors - self.score_min) / (self.score_max - self.score_min)
+            self.threshold = float(np.percentile(errors_norm, 95))
+        else:
+            self.threshold = float(np.percentile(errors, 95))
+
         print(f"  LSTM training threshold (p95): {self.threshold:.6f}")
+        print(f"  Score range: [{self.score_min:.6f}, {self.score_max:.6f}]")
 
         self.train_stats = {
             'n_samples': n_seq,
             'n_features': n_feat,
-            'sequence_length': seq_len
+            'sequence_length': seq_len,
+            'score_min': self.score_min,
+            'score_max': self.score_max,
+            'threshold': self.threshold
         }
         self.is_fitted = True
         return self
 
     # ------------------------------------------------------------------
     def predict_score(self, X: np.ndarray) -> np.ndarray:
-        """Return normalised reconstruction errors."""
+        """Return normalized reconstruction errors."""
         if not self.is_fitted:
             raise ValueError("Model must be fitted before prediction")
 
@@ -186,16 +205,19 @@ class LSTMAutoencoderDetector(BaseAnomalyModel):
             recon = self.model(X_tensor)
             errors = torch.mean((X_tensor - recon) ** 2, dim=(1, 2)).cpu().numpy()
 
-        # Normalise by threshold (score > 1.0 = anomalous)
-        if self.threshold and self.threshold > 0:
-            return errors / self.threshold
+        # NEW: Normalize scores to [0, 1] using stored min/max
+        if self.score_max > self.score_min:
+            errors = (errors - self.score_min) / (self.score_max - self.score_min)
+        else:
+            errors = np.clip(errors, 0, 1)
+
         return errors
 
     # ------------------------------------------------------------------
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict labels using the stored threshold."""
         scores = self.predict_score(X)
-        return (scores > 1.0).astype(int)
+        return (scores > self.threshold).astype(int)
 
     # ------------------------------------------------------------------
     def save_model(self, filepath: str):
@@ -215,10 +237,13 @@ class LSTMAutoencoderDetector(BaseAnomalyModel):
             'hidden_size': self.hidden_size,
             'num_layers': self.num_layers,
             'sequence_length': self.sequence_length,
-            'device': str(self.device)
+            'device': str(self.device),
+            # NEW: Save normalization parameters
+            'score_min': self.score_min,
+            'score_max': self.score_max,
         }
 
-        # Save with joblib (most robust for ML models)
+        # Save with joblib
         joblib.dump(save_data, filepath, compress=3)
         print(f"  LSTM model saved → {filepath}")
 
@@ -241,6 +266,10 @@ class LSTMAutoencoderDetector(BaseAnomalyModel):
         inst.scaler_mean = data['scaler_mean']
         inst.scaler_std = data['scaler_std']
 
+        # NEW: Load normalization parameters
+        inst.score_min = data.get('score_min', 0.0)
+        inst.score_max = data.get('score_max', 1.0)
+
         # Rebuild model
         n_feat = len(inst.feature_names)
         inst.model = LSTMAutoencoder(
@@ -255,6 +284,8 @@ class LSTMAutoencoderDetector(BaseAnomalyModel):
         inst.is_fitted = True
 
         print(f"  LSTM model loaded successfully")
+        print(f"  Score range: [{inst.score_min:.4f}, {inst.score_max:.4f}]")
+        print(f"  Threshold: {inst.threshold:.6f}")
         return inst
 
     # ------------------------------------------------------------------

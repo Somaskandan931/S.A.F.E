@@ -1,0 +1,6 @@
+Trained Models:
+  - isolation_forest
+  - oneclass_svm
+  - zscore
+  - mad
+  - lstm_autoencoder
